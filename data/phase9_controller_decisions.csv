@@ -1,0 +1,7 @@
+dataset,agent_role,n,continue_rate,mean_selected_steps,mean_predicted_utility,stop_rate
+arc_challenge,critic,256,0.601562,16.015625,0.00603,0.398438
+arc_challenge,planner,256,0.832031,18.320312,0.020072,0.167969
+arc_challenge,solver,256,0.527344,15.273438,0.007256,0.472656
+gsm8k,critic,256,0.613281,16.132812,0.004799,0.386719
+gsm8k,planner,256,0.769531,17.695312,0.034263,0.230469
+gsm8k,solver,256,0.464844,14.648438,0.008697,0.535156

@@ -1,0 +1,42 @@
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets - NEVER COMMIT
+.env
+.env.*
+!.env.example
+kaggle.json
+**/kaggle.json
+access_token
+*.pem
+*.key
+.streamlit/secrets.toml
+
+# Local downloads / generated Kaggle artifacts
+artifacts/
+downloads/
+*.zip
+*.tar
+*.tar.gz
+
+# Model/checkpoint weights
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.joblib
+
+# Large runtime caches
+.cache/
+huggingface/

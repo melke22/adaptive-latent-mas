@@ -1,0 +1,7 @@
+dataset,comparison,n,adaptive_accuracy,baseline_accuracy,accuracy_difference,accuracy_difference_ci95_low,accuracy_difference_ci95_high,mcnemar_exact_p,mean_latent_steps_saved,relative_latent_step_change_percent,mean_latency_difference_seconds
+gsm8k,adaptive_vs_fixed_10,256,0.542969,0.601562,-0.058594,-0.125,0.003906,0.095924,-18.476562,-61.588542,-1.064403
+gsm8k,adaptive_vs_fixed_20,256,0.542969,0.425781,0.117188,0.058594,0.179688,0.000287,11.523438,19.205729,0.801034
+arc_challenge,adaptive_vs_fixed_10,256,0.707031,0.636719,0.070312,0.0,0.144531,0.059808,-19.609375,-65.364583,-0.462276
+arc_challenge,adaptive_vs_fixed_20,256,0.707031,0.699219,0.007812,-0.046875,0.062598,0.891923,10.390625,17.317708,-0.338223
+combined,adaptive_vs_fixed_10,512,0.625,0.619141,0.005859,-0.041016,0.052734,0.871618,-19.042969,-63.476562,-0.76334
+combined,adaptive_vs_fixed_20,512,0.625,0.5625,0.0625,0.021484,0.105469,0.004455,10.957031,18.261719,0.231406
