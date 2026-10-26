@@ -7,37 +7,30 @@ def run_kaggle(*args):
         [sys.executable, "-m", "kaggle", *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
 
-print("Checking Kaggle CLI...")
+def main():
+    print("Checking Kaggle CLI...")
+    result = run_kaggle("--version")
+    print(result.stdout.strip() or result.stderr.strip())
+    if result.returncode != 0:
+        print("ERROR: Kaggle CLI is not available.")
+        return result.returncode
 
-p = run_kaggle("--version")
+    print("\nChecking Kaggle authentication...")
+    result = run_kaggle("kernels", "list", "-m", "--page-size", "1")
+    print(result.stdout.strip() or result.stderr.strip())
+    if result.returncode != 0:
+        print("\nERROR: Kaggle authentication failed.")
+        print("Authenticate with: python -m kaggle auth login")
+        return result.returncode
 
-print(p.stdout.strip() or p.stderr.strip())
-
-if p.returncode != 0:
-    print("ERROR: Kaggle CLI is not available.")
-    sys.exit(p.returncode)
-
-
-print("\nChecking Kaggle authentication...")
-
-p = run_kaggle(
-    "kernels",
-    "list",
-    "-m",
-    "--page-size",
-    "1",
-)
-
-print(p.stdout.strip() or p.stderr.strip())
-
-if p.returncode != 0:
-    print("\nERROR: Kaggle authentication failed.")
-    print("Authenticate with:")
-    print("python -m kaggle auth login")
-    sys.exit(p.returncode)
+    print("\nKAGGLE_CONNECTION_OK")
+    return 0
 
 
-print("\nKAGGLE_CONNECTION_OK")
+if __name__ == "__main__":
+    raise SystemExit(main())
