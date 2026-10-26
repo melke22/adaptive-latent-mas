@@ -1,0 +1,17 @@
+{
+  "id": "malkee/adaptive-latent-mas-live-inference",
+  "title": "Adaptive Latent MAS Live Inference",
+  "code_file": "remote_inference.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "malkee/adaptive-latent-mas-phase8-complete"
+  ],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": []
+}

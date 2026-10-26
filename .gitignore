@@ -3,6 +3,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.ruff_cache/
 .venv/
 venv/
 
@@ -40,3 +41,10 @@ downloads/
 # Large runtime caches
 .cache/
 huggingface/
+
+# Kaggle generated runtime source
+.kaggle_runtime/
+
+# Temporary notebook downloads and patch installation notes
+tmp_phase*_kaggle/
+GITIGNORE_APPEND.txt

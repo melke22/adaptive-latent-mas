@@ -23,8 +23,15 @@
 
 6. Open **Reproducibility**.
    - Show frozen threshold, no test retraining, sealed remainder, continuation verification,
-     and 72/72 tests.
+     and the historical 72/72 external research-backend tests. These are separate
+     from this repository's local UI and data checks.
 
-7. If asked about future work:
+7. Open **Live Kaggle Inference** and show **Verified demo — instant**.
+   - Explain that this is saved evidence from a completed fidelity run.
+   - Show prediction 320 and Planner/Critic/Solver allocations of 20/20/10.
+   - A fresh run requires Kaggle credentials, the external Phase-8 artifacts,
+     and time for GPU provisioning and model loading.
+
+8. If asked about future work:
    - State that progressive 5→10→15→20 learned halting is pre-declared and not yet claimed complete.
    - Heterogeneous cross-model alignment is a later extension.

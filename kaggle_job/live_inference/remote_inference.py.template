@@ -1,0 +1,544 @@
+# ======================================================================================
+# Adaptive Latent MAS — Dedicated Kaggle Live Inference Kernel
+# Research system: Planner -> Critic -> Solver with learned 10/20 adaptive latent depth.
+#
+# IMPORTANT:
+# - This is NOT a training script.
+# - It restores the frozen PHASE_8_COMPLETE artifact.
+# - It does not tune on the request.
+# - It writes one machine-readable response.json to /kaggle/working/live_inference_output.
+# ======================================================================================
+
+from __future__ import annotations
+
+import gc
+import hashlib
+import json
+import os
+import shutil
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# The local launcher replaces this exact placeholder in a temporary copy before `kaggle kernels push`.
+REQUEST = json.loads(__REQUEST_JSON_LITERAL__)
+
+SEED = 42
+MODEL_ID = "Qwen/Qwen3-4B"
+MODEL_REVISION = "1cfa9a7208912126459214e8b04321603b3df60c"
+LOW_STEPS = 10
+HIGH_STEPS = 20
+MAX_NEW_TOKENS = 160
+CONTROLLER_THRESHOLD = 0.0
+MASTER_ARCHIVE_NAME = "adaptive-latent-mas_phase8_complete.zip"
+
+WORKING_ROOT = Path("/kaggle/working")
+INPUT_ROOT = Path("/kaggle/input")
+PROJECT_ROOT = WORKING_ROOT / "adaptive-latent-mas"
+OUTPUT_DIR = WORKING_ROOT / "live_inference_output"
+OUTPUT_PATH = OUTPUT_DIR / "response.json"
+
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def phase8_complete(root: Path) -> bool:
+    manifest = root / "experiments/summaries/phase8_final_manifest.json"
+    if not manifest.exists():
+        return False
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        return payload.get("status") == "PHASE_8_COMPLETE"
+    except Exception:
+        return False
+
+
+def restore_phase8_project() -> None:
+    if phase8_complete(PROJECT_ROOT):
+        return
+
+    # Preferred source: the exact Phase-8 master ZIP used by the completed Phase-9 notebook.
+    archives = sorted(
+        INPUT_ROOT.rglob(MASTER_ARCHIVE_NAME),
+        key=lambda p: (p.stat().st_size, str(p)),
+    )
+    if archives:
+        if PROJECT_ROOT.exists():
+            shutil.rmtree(PROJECT_ROOT)
+        PROJECT_ROOT.mkdir(parents=True, exist_ok=True)
+        shutil.unpack_archive(str(archives[-1]), extract_dir=str(PROJECT_ROOT))
+        if phase8_complete(PROJECT_ROOT):
+            return
+
+    # Fallback: some Kaggle dataset versions expose the verified project tree directly.
+    manifests = list(INPUT_ROOT.rglob("phase8_final_manifest.json"))
+    candidates = []
+    for manifest in manifests:
+        try:
+            root = manifest.parents[2]
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            model = root / payload["model"]["path"]
+            realigner = root / "data/metadata/qwen3_4b_latent_realign.pt"
+            if (
+                payload.get("status") == "PHASE_8_COMPLETE"
+                and (root / "src").exists()
+                and model.exists()
+                and realigner.exists()
+            ):
+                candidates.append(root)
+        except Exception:
+            pass
+
+    if not candidates:
+        raise FileNotFoundError(
+            "No verified PHASE_8_COMPLETE project was found in /kaggle/input."
+        )
+
+    source = sorted(candidates, key=lambda p: str(p))[0]
+    if PROJECT_ROOT.exists():
+        shutil.rmtree(PROJECT_ROOT)
+    shutil.copytree(source, PROJECT_ROOT)
+
+    if not phase8_complete(PROJECT_ROOT):
+        raise RuntimeError("Restored project failed PHASE_8_COMPLETE verification.")
+
+
+restore_phase8_project()
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+PHASE8_MANIFEST_PATH = PROJECT_ROOT / "experiments/summaries/phase8_final_manifest.json"
+PHASE8_MANIFEST = json.loads(PHASE8_MANIFEST_PATH.read_text(encoding="utf-8"))
+CONTROLLER_PATH = PROJECT_ROOT / PHASE8_MANIFEST["model"]["path"]
+ALIGNMENT_PATH = PROJECT_ROOT / "data/metadata/qwen3_4b_latent_realign.pt"
+
+for required in (CONTROLLER_PATH, ALIGNMENT_PATH):
+    if not required.exists():
+        raise FileNotFoundError(required)
+
+expected_sha = PHASE8_MANIFEST["model"].get("sha256")
+if expected_sha and sha256_file(CONTROLLER_PATH) != expected_sha:
+    raise RuntimeError("Frozen Phase-8 controller SHA-256 verification failed.")
+
+from src.communication.latent_prompts import (
+    render_planner_prompt,
+    render_critic_prompt,
+    render_solver_prompt,
+)
+from src.controllers.learned_marginal_utility import LearnedMarginalUtilityController
+from src.evaluation.parsers import extract_prediction, is_correct
+from src.datasets.loader import load_records
+from src.latent.alignment import LatentRealigner
+from src.latent.cache import past_length
+from src.latent.latent_state_decoder import LatentStateDecoder
+from src.latent.rollout import LatentRollout, LatentRolloutEngine, LatentStepTrace
+from src.controllers.signals import predictive_entropy, representation_distance
+
+if not torch.cuda.is_available():
+    raise RuntimeError("Live adaptive inference requires a Kaggle GPU runtime.")
+
+LATENT_DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+
+class PinnedQwenBackend:
+    def __init__(self, model_id: str, revision: str, dtype):
+        self.model_id = model_id
+        self.revision = revision
+        self.device = "cuda"
+        self.dtype = dtype
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            revision=revision,
+            use_fast=True,
+        )
+
+        kwargs = dict(
+            pretrained_model_name_or_path=model_id,
+            revision=revision,
+            device_map={"": 0},
+        )
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(dtype=dtype, **kwargs)
+        except TypeError:
+            self.model = AutoModelForCausalLM.from_pretrained(torch_dtype=dtype, **kwargs)
+
+        self.model.eval()
+        for parameter in self.model.parameters():
+            parameter.requires_grad_(False)
+
+        self.output_embeddings = self.model.get_output_embeddings()
+
+    @property
+    def hidden_size(self):
+        return int(self.model.config.hidden_size)
+
+    def project_hidden_to_logits(self, hidden_state):
+        return self.output_embeddings(hidden_state)
+
+
+backend = PinnedQwenBackend(MODEL_ID, MODEL_REVISION, LATENT_DTYPE)
+
+resolved_revision = getattr(backend.model.config, "_commit_hash", None)
+if resolved_revision is not None and str(resolved_revision) != MODEL_REVISION:
+    raise RuntimeError(
+        f"Model revision mismatch: {resolved_revision} != {MODEL_REVISION}"
+    )
+
+realigner = LatentRealigner(
+    backend.model,
+    cache_path=ALIGNMENT_PATH,
+    regularization=1e-5,
+    enabled=True,
+)
+realigner.build()
+
+rollout_engine = LatentRolloutEngine(backend, realigner)
+latent_decoder = LatentStateDecoder(backend)
+adaptive_controller = LearnedMarginalUtilityController.load(
+    CONTROLLER_PATH,
+    threshold=CONTROLLER_THRESHOLD,
+)
+
+
+@torch.inference_mode()
+def continue_latent_rollout(base_rollout: LatentRollout, extra_steps: int) -> LatentRollout:
+    if extra_steps < 1:
+        raise ValueError("extra_steps must be >= 1")
+
+    past = base_rollout.past_key_values
+    previous_hidden = base_rollout.last_hidden_state
+    traces = list(base_rollout.traces)
+    start_step = int(base_rollout.latent_steps)
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    started = time.perf_counter()
+
+    for offset in range(1, int(extra_steps) + 1):
+        latent_vector = realigner(previous_hidden)
+        latent_embedding = latent_vector.unsqueeze(1)
+
+        cache_len = past_length(past)
+        attention_mask = torch.ones(
+            (latent_embedding.shape[0], cache_len + 1),
+            dtype=torch.long,
+            device=latent_embedding.device,
+        )
+
+        outputs = backend.model(
+            inputs_embeds=latent_embedding,
+            attention_mask=attention_mask,
+            past_key_values=past,
+            use_cache=True,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+        past = outputs.past_key_values
+        current_hidden = outputs.hidden_states[-1][:, -1, :]
+
+        distance = representation_distance(current_hidden, previous_hidden)
+        logits = backend.project_hidden_to_logits(current_hidden)
+        entropy = predictive_entropy(logits)
+
+        traces.append(
+            LatentStepTrace(
+                step=start_step + offset,
+                representation_distance=float(distance.item()),
+                entropy=float(entropy.item()),
+                hidden_norm=float(current_hidden.float().norm(dim=-1).item()),
+            )
+        )
+        previous_hidden = current_hidden
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    extra_latency = time.perf_counter() - started
+
+    return LatentRollout(
+        past_key_values=past,
+        last_hidden_state=previous_hidden,
+        prompt_tokens=int(base_rollout.prompt_tokens),
+        latent_steps=start_step + int(extra_steps),
+        latency_seconds=float(base_rollout.latency_seconds + extra_latency),
+        initial_cache_length=int(base_rollout.initial_cache_length),
+        final_cache_length=int(past_length(past)),
+        traces=traces,
+    )
+
+
+def signals_first10(rollout: LatentRollout):
+    if len(rollout.traces) < 10:
+        raise RuntimeError("Controller requires ten latent traces.")
+    return [
+        {
+            "step": int(trace.step),
+            "representation_distance": float(trace.representation_distance),
+            "entropy": float(trace.entropy),
+            "hidden_norm": float(trace.hidden_norm),
+        }
+        for trace in rollout.traces[:10]
+    ]
+
+
+def controller_decision(role: str, rollout10: LatentRollout):
+    started = time.perf_counter()
+    decision = adaptive_controller.decide(role, signals_first10(rollout10))
+    return decision, float(time.perf_counter() - started)
+
+
+def compute_tier(total_steps: int) -> str:
+    if total_steps <= 30:
+        return "LOW"
+    if total_steps <= 50:
+        return "MEDIUM"
+    return "HIGH"
+
+
+# Only examples already opened/evaluated in Phase 9 may be used for benchmark-fidelity checks.
+# This prevents the live UI from accidentally opening the SEALED_REMAINDER.
+ALLOWED_PHASE9_VERIFICATION_IDS = {
+    "gsm8k": {"gsm8k_test_00198"},
+    "arc_challenge": set(),
+}
+
+
+def validate_request(payload: dict) -> dict:
+    dataset = str(payload.get("dataset", "")).strip().lower()
+    if dataset not in {"gsm8k", "arc_challenge"}:
+        raise ValueError("dataset must be 'gsm8k' or 'arc_challenge'.")
+
+    benchmark_example_id = payload.get("benchmark_example_id")
+    if benchmark_example_id:
+        benchmark_example_id = str(benchmark_example_id).strip()
+
+        if benchmark_example_id not in ALLOWED_PHASE9_VERIFICATION_IDS.get(dataset, set()):
+            raise ValueError(
+                "This benchmark ID is not in the pre-approved Phase-9 verification set. "
+                "The restriction protects the sealed test remainder."
+            )
+
+        matches = [
+            record
+            for record in load_records(dataset, "test")
+            if str(record["id"]) == benchmark_example_id
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"Could not resolve exactly one official {dataset} record for "
+                f"{benchmark_example_id!r}; found {len(matches)}."
+            )
+
+        record = dict(matches[0])
+        record["request_source"] = "phase9_evaluated_benchmark"
+        return record
+
+    question = str(payload.get("question", "")).strip()
+    reference = payload.get("reference_answer", None)
+
+    if not question:
+        raise ValueError(
+            "Custom inference requires a non-empty question, or provide benchmark_example_id."
+        )
+
+    return {
+        "id": str(payload.get("id", "live_request")),
+        "dataset": dataset,
+        "split": "live",
+        "question": question,
+        "reference_answer": "" if reference is None else str(reference),
+        "request_source": "custom_question",
+    }
+
+
+@torch.inference_mode()
+def run_adaptive(record: dict) -> dict:
+    wall_start = time.perf_counter()
+    controller_latency = 0.0
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    planner_prompt = render_planner_prompt(backend, record)
+    critic_prompt = render_critic_prompt(backend, record)
+    solver_prompt = render_solver_prompt(backend, record)
+
+    planner = rollout_engine.rollout(
+        planner_prompt,
+        latent_steps=LOW_STEPS,
+        past_key_values=None,
+    )
+    p_decision, p_time = controller_decision("planner", planner)
+    controller_latency += p_time
+    if p_decision["continue_reasoning"]:
+        planner = continue_latent_rollout(planner, HIGH_STEPS - LOW_STEPS)
+
+    critic = rollout_engine.rollout(
+        critic_prompt,
+        latent_steps=LOW_STEPS,
+        past_key_values=planner.past_key_values,
+    )
+    c_decision, c_time = controller_decision("critic", critic)
+    controller_latency += c_time
+    if c_decision["continue_reasoning"]:
+        critic = continue_latent_rollout(critic, HIGH_STEPS - LOW_STEPS)
+
+    solver = rollout_engine.rollout(
+        solver_prompt,
+        latent_steps=LOW_STEPS,
+        past_key_values=critic.past_key_values,
+    )
+    s_decision, s_time = controller_decision("solver", solver)
+    controller_latency += s_time
+    if s_decision["continue_reasoning"]:
+        solver = continue_latent_rollout(solver, HIGH_STEPS - LOW_STEPS)
+
+    decoded = latent_decoder.generate(
+        last_hidden_state=solver.last_hidden_state,
+        past_key_values=solver.past_key_values,
+        max_new_tokens=MAX_NEW_TOKENS,
+    )
+
+    prediction = extract_prediction(record["dataset"], decoded["text"])
+
+    p_steps = int(planner.latent_steps)
+    c_steps = int(critic.latent_steps)
+    s_steps = int(solver.latent_steps)
+    total_steps = p_steps + c_steps + s_steps
+
+    reference = record.get("reference_answer", "")
+    correctness = None
+    if reference:
+        correctness = bool(is_correct(record["dataset"], prediction, reference))
+
+    peak_gpu_gb = (
+        float(torch.cuda.max_memory_allocated() / (1024 ** 3))
+        if torch.cuda.is_available()
+        else None
+    )
+
+    return {
+        "status": "SUCCESS",
+        "mode": "LIVE_KAGGLE_GPU",
+        "method": "three_agent_learned_adaptive_latent",
+        "request": {
+            "id": record["id"],
+            "dataset": record["dataset"],
+            "question": record["question"],
+            "reference_answer_supplied": bool(reference),
+            "source": record.get("request_source", "unknown"),
+        },
+        "model": {
+            "id": MODEL_ID,
+            "revision": MODEL_REVISION,
+            "dtype": str(LATENT_DTYPE),
+        },
+        "controller": {
+            "name": PHASE8_MANIFEST.get("selected_model", "gradient_boosting_huber"),
+            "threshold": CONTROLLER_THRESHOLD,
+            "sha256": sha256_file(CONTROLLER_PATH),
+        },
+        "prediction": prediction,
+        "reference_answer": reference if reference else None,
+        "correct": correctness,
+        "raw_output": decoded["text"],
+        "agents": {
+            "planner": {
+                "decision": p_decision["decision"],
+                "predicted_marginal_utility": float(p_decision["predicted_marginal_utility"]),
+                "latent_steps": p_steps,
+                "prompt_tokens": int(planner.prompt_tokens),
+                "latent_latency_seconds": float(planner.latency_seconds),
+            },
+            "critic": {
+                "decision": c_decision["decision"],
+                "predicted_marginal_utility": float(c_decision["predicted_marginal_utility"]),
+                "latent_steps": c_steps,
+                "prompt_tokens": int(critic.prompt_tokens),
+                "latent_latency_seconds": float(critic.latency_seconds),
+            },
+            "solver": {
+                "decision": s_decision["decision"],
+                "predicted_marginal_utility": float(s_decision["predicted_marginal_utility"]),
+                "latent_steps": s_steps,
+                "prompt_tokens": int(solver.prompt_tokens),
+                "latent_latency_seconds": float(solver.latency_seconds),
+            },
+        },
+        "total_latent_steps": total_steps,
+        "latent_step_saving_vs_fixed20_percent": float(100.0 * (60 - total_steps) / 60.0),
+        "compute_tier": compute_tier(total_steps),
+        "generated_tokens": int(decoded["generated_tokens"]),
+        "intermediate_generated_tokens": 0,
+        "decode_prompt_tokens": int(decoded["decode_prompt_tokens"]),
+        "prompt_tokens_total": int(
+            planner.prompt_tokens + critic.prompt_tokens + solver.prompt_tokens
+        ),
+        "controller_latency_seconds": float(controller_latency),
+        "decode_latency_seconds": float(decoded["latency_seconds"]),
+        "model_component_latency_seconds": float(
+            planner.latency_seconds
+            + critic.latency_seconds
+            + solver.latency_seconds
+            + decoded["latency_seconds"]
+        ),
+        "wall_latency_seconds": float(time.perf_counter() - wall_start),
+        "peak_gpu_memory_gb": peak_gpu_gb,
+        "decoder_transition": decoded["transition"],
+        "true_10_to_20_continuation": True,
+        "intermediate_text_generated": False,
+    }
+
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+try:
+    record = validate_request(REQUEST)
+    response = run_adaptive(record)
+except Exception as exc:
+    response = {
+        "status": "ERROR",
+        "mode": "LIVE_KAGGLE_GPU",
+        "error_type": type(exc).__name__,
+        "error_message": str(exc),
+    }
+
+OUTPUT_PATH.write_text(
+    json.dumps(response, indent=2, ensure_ascii=False),
+    encoding="utf-8",
+)
+
+print("=" * 88)
+print("ADAPTIVE LATENT MAS — LIVE KAGGLE INFERENCE")
+print("=" * 88)
+print("status      :", response.get("status"))
+if response.get("status") == "SUCCESS":
+    print("prediction  :", response.get("prediction"))
+    print("latent steps:", response.get("total_latent_steps"))
+    print("tier        :", response.get("compute_tier"))
+    print("saving F20  :", f"{response.get('latent_step_saving_vs_fixed20_percent', 0):.2f}%")
+else:
+    print("error       :", response.get("error_message"))
+print("response    :", OUTPUT_PATH)
+print("=" * 88)
+
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()

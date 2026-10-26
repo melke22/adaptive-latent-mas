@@ -1,0 +1,64 @@
+{
+  "status": "SUCCESS",
+  "mode": "LIVE_KAGGLE_GPU",
+  "method": "three_agent_learned_adaptive_latent",
+  "request": {
+    "id": "gsm8k_test_00198",
+    "dataset": "gsm8k",
+    "question": "Elaine initially had 20 Pokemon cards. After a month, she collected three times that number. In the secondmonth, she collected 20 fewer cards than those she collected in the first month. In the third month, she collected twice the combined number of pokemon cards she collected in the first and second months. How many pokemon cards does she have now intotal?",
+    "reference_answer_supplied": true,
+    "source": "phase9_evaluated_benchmark"
+  },
+  "model": {
+    "id": "Qwen/Qwen3-4B",
+    "revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+    "dtype": "torch.bfloat16"
+  },
+  "controller": {
+    "name": "gradient_boosting_huber",
+    "threshold": 0.0,
+    "sha256": "f010da6de8572c971b345dfad39192ff70abf66376e7d34273e745aa778550f1"
+  },
+  "prediction": "320",
+  "reference_answer": "320",
+  "correct": true,
+  "raw_output": "1. Elaine initially had 20 Pokemon cards.\n2. After the first month, she collected 3 × 20 = 60 cards.\n3. In the second month, she collected 60 - 20 = 40 cards.\n4. In the third month, she collected 2 × (60 + 40) = 200 cards.\n5. Total cards = 20 + 60 + 40 + 200 = 320.\n\nFinal answer: 320",
+  "agents": {
+    "planner": {
+      "decision": "CONTINUE",
+      "predicted_marginal_utility": 0.03903475419987214,
+      "latent_steps": 20,
+      "prompt_tokens": 151,
+      "latent_latency_seconds": 2.88867386000004
+    },
+    "critic": {
+      "decision": "CONTINUE",
+      "predicted_marginal_utility": 0.017269287617475634,
+      "latent_steps": 20,
+      "prompt_tokens": 162,
+      "latent_latency_seconds": 1.8670941549999611
+    },
+    "solver": {
+      "decision": "STOP",
+      "predicted_marginal_utility": -0.003392285567713774,
+      "latent_steps": 10,
+      "prompt_tokens": 162,
+      "latent_latency_seconds": 1.1890904750000004
+    }
+  },
+  "total_latent_steps": 50,
+  "latent_step_saving_vs_fixed20_percent": 16.666666666666668,
+  "compute_tier": "MEDIUM",
+  "generated_tokens": 123,
+  "intermediate_generated_tokens": 0,
+  "decode_prompt_tokens": 0,
+  "prompt_tokens_total": 475,
+  "controller_latency_seconds": 0.04130269399996678,
+  "decode_latency_seconds": 6.930847242000027,
+  "model_component_latency_seconds": 12.875705732000029,
+  "wall_latency_seconds": 12.953712918000008,
+  "peak_gpu_memory_gb": 7.712076663970947,
+  "decoder_transition": "direct_from_solver_latent",
+  "true_10_to_20_continuation": true,
+  "intermediate_text_generated": false
+}
